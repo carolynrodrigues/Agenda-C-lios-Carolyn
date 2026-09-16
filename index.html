@@ -287,6 +287,9 @@ const DEFAULT_DATA = {
   expenses: [],
   blocked: [],
   settings: {
+    periods: [{ start: "08:00", end: "10:30" }, { start: "13:00", end: "18:00" }],
+    slotStep: 30,
+    // legacy field, kept only so old saved data still loads; no longer used to decide availability
     timeSlots: ["08:00", "08:30", "09:00", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00"],
     closedDays: [0],
     // 0 = domingo
@@ -389,6 +392,32 @@ function money(n) {
     currency: "BRL"
   });
 }
+// Data de nascimento digitada como texto corrido "DD/MM/AAAA", convertida
+// pra ISO (AAAA-MM-DD) só internamente, pra não precisar do calendário nativo.
+function maskBirthDateInput(raw) {
+  const digits = (raw || "").replace(/\D/g, "").slice(0, 8);
+  let out = digits;
+  if (digits.length > 4) out = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+  else if (digits.length > 2) out = `${digits.slice(0, 2)}/${digits.slice(2)}`;
+  return out;
+}
+function brDateToISO(br) {
+  const m = (br || "").match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return "";
+  const [, d, mo, y] = m;
+  const day = parseInt(d, 10), month = parseInt(mo, 10), year = parseInt(y, 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1900 || year > 2100) return "";
+  // confere se a data existe de verdade (ex.: recusa 31/02)
+  const test = new Date(year, month - 1, day);
+  if (test.getFullYear() !== year || test.getMonth() !== month - 1 || test.getDate() !== day) return "";
+  return `${y}-${mo}-${d}`;
+}
+function isoDateToBR(iso) {
+  const m = (iso || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return "";
+  const [, y, mo, d] = m;
+  return `${d}/${mo}/${y}`;
+}
 function computeDeposit(price, settings) {
   if (!settings.depositEnabled) return 0;
   if (settings.depositType === "fixed") return Math.min(settings.depositValue || 0, price);
@@ -401,9 +430,44 @@ function isClosedDay(iso, settings) {
   const weekday = new Date(y, m - 1, d).getDay(); // 0 = domingo
   return (settings.closedDays || []).includes(weekday);
 }
+// Períodos de funcionamento configurados (ex.: manhã 08:00–10:30, tarde 13:00–18:00).
+// Mantém compatibilidade com dados antigos que só tinham "timeSlots".
+function getPeriods(settings) {
+  if (settings.periods && settings.periods.length > 0) return settings.periods;
+  return DEFAULT_DATA.settings.periods;
+}
+function getSlotStep(settings) {
+  return settings.slotStep || 30;
+}
+// Lista de horários de início oferecidos no dia: um a cada `slotStep` minutos,
+// dentro de cada período configurado (o horário de fechamento do período NUNCA
+// vira um horário de início — é só o limite em que os atendimentos precisam terminar).
 function hoursForDate(iso, settings) {
   if (isClosedDay(iso, settings)) return [];
-  return settings.timeSlots;
+  const step = getSlotStep(settings);
+  const result = [];
+  getPeriods(settings).forEach(p => {
+    const startMin = timeToMinutes(p.start);
+    const endMin = timeToMinutes(p.end);
+    for (let m = startMin; m < endMin; m += step) {
+      result.push(minutesToTime(m));
+    }
+  });
+  return result;
+}
+// Um horário (início de um bloco de 30min qualquer, não precisa ser um horário
+// "oferecido") está dentro do expediente se cair dentro de algum período aberto.
+function withinOpenPeriod(t, settings) {
+  const tm = timeToMinutes(t);
+  return getPeriods(settings).some(p => tm >= timeToMinutes(p.start) && tm < timeToMinutes(p.end));
+}
+// Um atendimento que começa em `time` e dura `durationMin` cabe se existir um
+// período que o contenha por inteiro, do início ao fim (não pode atravessar o
+// horário de fechamento nem o intervalo entre dois períodos, tipo o almoço).
+function fitsWithinPeriod(time, durationMin, settings) {
+  const startMin = timeToMinutes(time);
+  const endMin = startMin + (durationMin || 30);
+  return getPeriods(settings).some(p => startMin >= timeToMinutes(p.start) && endMin <= timeToMinutes(p.end));
 }
 function timeToMinutes(t) {
   const [h, m] = t.split(":").map(Number);
@@ -750,6 +814,20 @@ function ClientView({
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [birthDate, setBirthDate] = useState("");
+  const [birthDateText, setBirthDateText] = useState("");
+  const [birthDateError, setBirthDateError] = useState(false);
+  function handleBirthDateChange(raw) {
+    const masked = maskBirthDateInput(raw);
+    setBirthDateText(masked);
+    if (masked.length === 10) {
+      const iso = brDateToISO(masked);
+      setBirthDate(iso);
+      setBirthDateError(!iso);
+    } else {
+      setBirthDate("");
+      setBirthDateError(false);
+    }
+  }
   const [allergies, setAllergies] = useState("");
   const [phone, setPhone] = useState("");
   const [payment, setPayment] = useState(PAYMENTS[0]);
@@ -779,6 +857,7 @@ function ClientView({
     }
     if (!birthDate && latest.birthDate) {
       setBirthDate(latest.birthDate);
+      setBirthDateText(isoDateToBR(latest.birthDate));
       didFill = true;
     }
     if (!allergies.trim() && latest.allergies) {
@@ -820,6 +899,12 @@ function ClientView({
   function isBlocked(iso, time) {
     return data.blocked.some(b => b.date === iso && b.time === time);
   }
+  function wouldFitService(time) {
+    const addOnsChosen = (settings.addOns || []).filter(a => selectedAddOns.includes(a.id));
+    const duration = totalDuration(service, addOnsChosen);
+    if (!fitsWithinPeriod(time, duration, settings)) return false;
+    return slotsOccupied(time, duration).every(t => withinOpenPeriod(t, settings) && !isTaken(selectedDate, t) && !isBlocked(selectedDate, t));
+  }
   function toggleAddOn(id) {
     setSelectedAddOns(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   }
@@ -831,8 +916,7 @@ function ClientView({
     const deposit = computeDeposit(price, settings);
     const duration = totalDuration(service, addOnsChosen);
     const requiredSlots = slotsOccupied(selectedTime, duration);
-    const dayHours = hoursForDate(selectedDate, settings);
-    const fits = requiredSlots.every(t => dayHours.includes(t) && !isTaken(selectedDate, t) && !isBlocked(selectedDate, t));
+    const fits = fitsWithinPeriod(selectedTime, duration, settings) && requiredSlots.every(t => withinOpenPeriod(t, settings) && !isTaken(selectedDate, t) && !isBlocked(selectedDate, t));
     if (!fits) {
       setSlotError(`Esse horário precisa de ${duration} min e não cabe antes do fechamento ou esbarra em outro agendamento. Escolha outro horário.`);
       return;
@@ -1221,7 +1305,7 @@ function ClientView({
       gap: 8
     }
   }, hours.map((h, idx) => {
-    const disabled = isPast(selectedDate, h) || isTaken(selectedDate, h) || isBlocked(selectedDate, h);
+    const disabled = isPast(selectedDate, h) || isTaken(selectedDate, h) || isBlocked(selectedDate, h) || !wouldFitService(h);
     const active = selectedTime === h;
     const tint = hourTint(idx, hours.length);
     return /*#__PURE__*/React.createElement("button", {
@@ -1329,11 +1413,24 @@ function ClientView({
       marginBottom: 6
     }
   }, "Data de nascimento"), /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    value: birthDate,
-    onChange: e => setBirthDate(e.target.value),
-    style: input
-  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    type: "text",
+    inputMode: "numeric",
+    placeholder: "DD/MM/AAAA",
+    value: birthDateText,
+    onChange: e => handleBirthDateChange(e.target.value),
+    style: {
+      ...input,
+      fontFamily: "'JetBrains Mono', monospace",
+      ...(birthDateError ? errorInput : {})
+    },
+    maxLength: 10
+  }), birthDateError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: "#B3453A",
+      marginTop: 4
+    }
+  }, "Data inválida — confira dia/mês/ano.")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12.5,
       color: COLORS.muted,
@@ -1777,6 +1874,8 @@ function AdminAgenda({
   const [mService, setMService] = useState(prefillCliente?.serviceId || data.settings.services[0]?.id || null);
   const [mAddOns, setMAddOns] = useState([]);
   const [mNotes, setMNotes] = useState("");
+  const [mEncaixe, setMEncaixe] = useState(false);
+  const [customTime, setCustomTime] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [formError, setFormError] = useState("");
   const formRef = useRef(null);
@@ -1819,6 +1918,7 @@ function AdminAgenda({
     setMService(svc ? svc.id : settings.services[0]?.id || null);
     setMAddOns((b.addOns || []).map(a => a.id));
     setMNotes(b.notes || "");
+    setMEncaixe(!!b.encaixe);
   }
   function closeForm() {
     setManualOpen(null);
@@ -1828,6 +1928,7 @@ function AdminAgenda({
     setMPayment(PAYMENTS[0]);
     setMAddOns([]);
     setMNotes("");
+    setMEncaixe(false);
     setFormError("");
   }
   async function saveBooking() {
@@ -1839,15 +1940,17 @@ function AdminAgenda({
     const duration = totalDuration(service, addOnsChosen);
     const nameParts = mName.trim().split(" ");
     const requiredSlots = slotsOccupied(manualOpen, duration);
-    const dayHours = hoursForDate(selectedDate, settings);
-    const fits = requiredSlots.every(t => {
-      if (!dayHours.includes(t)) return false;
+    const fits = mEncaixe ? requiredSlots.every(t => {
+      const covering = data.bookings.find(b => bookingCoversSlot(b, selectedDate, t) && b.id !== editingId);
+      return !covering;
+    }) : fitsWithinPeriod(manualOpen, duration, settings) && requiredSlots.every(t => {
+      if (!withinOpenPeriod(t, settings)) return false;
       if (blockedAt(selectedDate, t)) return false;
       const covering = data.bookings.find(b => bookingCoversSlot(b, selectedDate, t) && b.id !== editingId);
       return !covering;
     });
     if (!fits) {
-      setFormError(`Esse serviço dura ${duration} min e não cabe nesse horário (esbarra em outro agendamento, bloqueio, ou passa do fechamento).`);
+      setFormError(mEncaixe ? `Esse horário esbarra em outro agendamento já existente — escolha outro horário ou cancele/mova o outro atendimento primeiro.` : `Esse serviço dura ${duration} min e não cabe nesse horário (esbarra em outro agendamento, bloqueio, ou passa do fechamento). Marque "Encaixe" se quiser forçar mesmo assim.`);
       return;
     }
     setFormError("");
@@ -1866,7 +1969,8 @@ function AdminAgenda({
           price,
           deposit,
           duration,
-          notes: mNotes.trim()
+          notes: mNotes.trim(),
+          encaixe: mEncaixe
         } : b)
       };
       await persist(next);
@@ -1886,6 +1990,7 @@ function AdminAgenda({
         deposit,
         duration,
         notes: mNotes.trim(),
+        encaixe: mEncaixe,
         status: "agendado",
         source: "admin",
         createdAt: new Date().toISOString()
@@ -1995,7 +2100,42 @@ function AdminAgenda({
     icon: /*#__PURE__*/React.createElement(Clock, {
       size: 15
     })
-  }, "Horários do dia"), hours.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "Horários do dia"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      padding: "8px 10px",
+      marginBottom: 10,
+      borderRadius: 10,
+      border: `1px dashed ${COLORS.gold}`,
+      background: "#FBF3DE"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: customTime,
+    onChange: e => setCustomTime(e.target.value),
+    style: { ...input, flex: 1, padding: "6px 8px", fontSize: 13 }
+  }), /*#__PURE__*/React.createElement("button", {
+    style: { ...btnPrimarySm },
+    disabled: !customTime,
+    onClick: () => {
+      setEditingId(null);
+      setMName(prefillCliente?.name || "");
+      setMPhone(prefillCliente?.phone || "");
+      setMPayment(PAYMENTS[0]);
+      setMAddOns([]);
+      setMNotes("");
+      setFormError("");
+      setMEncaixe(true);
+      setManualOpen(customTime);
+    }
+  }, /*#__PURE__*/React.createElement(Plus, {
+    size: 12,
+    style: { marginRight: 4, verticalAlign: -2 }
+  }), "Encaixar nesse horário")), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 11, color: COLORS.muted, marginTop: -4, marginBottom: 10 }
+  }, "Use pra atender fora dos horários normais (antes de abrir, no almoço, depois de fechar etc). Os horários da grade abaixo já têm a opção \"Encaixe\" no formulário também."), hours.length === 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 13,
       color: COLORS.muted,
@@ -2049,7 +2189,17 @@ function AdminAgenda({
         alignItems: "center",
         gap: 5
       }
-    }, booking.name, booking.allergies && /*#__PURE__*/React.createElement(AlertTriangle, {
+    }, booking.name, booking.encaixe && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700,
+        color: COLORS.gold,
+        background: "#FBF3DE",
+        border: `1px solid ${COLORS.gold}`,
+        borderRadius: 6,
+        padding: "1px 6px"
+      }
+    }, "🔀 Encaixe"), booking.allergies && /*#__PURE__*/React.createElement(AlertTriangle, {
       size: 12,
       color: COLORS.danger,
       title: booking.allergies
@@ -2315,7 +2465,26 @@ function AdminAgenda({
       resize: "vertical",
       fontSize: 12.5
     }
-  })), formError && /*#__PURE__*/React.createElement("div", {
+  })), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      padding: "10px 12px",
+      borderRadius: 10,
+      border: `1px solid ${mEncaixe ? COLORS.gold : COLORS.border}`,
+      background: mEncaixe ? "#FBF3DE" : "transparent",
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: mEncaixe,
+    onChange: e => setMEncaixe(e.target.checked)
+  }), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 13, fontWeight: 700 }
+  }, "🔀 Encaixe"), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 11.5, color: COLORS.muted }
+  }, "Marca pra atender mesmo passando do horário de fechamento (ex.: seu marido leva a Agatha na escola nesse dia). Ainda não deixa marcar em cima de outro atendimento já existente."))), formError && /*#__PURE__*/React.createElement("div", {
     style: {
       color: COLORS.danger,
       fontSize: 12.5
@@ -3563,7 +3732,17 @@ function AdminConfig({
   persist
 }) {
   const [settings, setSettings] = useState(data.settings);
-  const [slotsText, setSlotsText] = useState((data.settings.timeSlots || []).join(", "));
+  const [periods, setPeriods] = useState(getPeriods(data.settings).map(p => ({ ...p })));
+  const [slotStep, setSlotStep] = useState(getSlotStep(data.settings));
+  function updatePeriod(idx, field, value) {
+    setPeriods(prev => prev.map((p, i) => i === idx ? { ...p, [field]: value } : p));
+  }
+  function addPeriod() {
+    setPeriods(prev => [...prev, { start: "13:00", end: "18:00" }]);
+  }
+  function removePeriod(idx) {
+    setPeriods(prev => prev.filter((_, i) => i !== idx));
+  }
   function updateService(id, field, value) {
     setSettings({
       ...settings,
@@ -3617,7 +3796,7 @@ function AdminConfig({
     });
   }
   async function save() {
-    const parsedSlots = slotsText.split(",").map(t => t.trim()).filter(Boolean);
+    const cleanPeriods = periods.filter(p => p.start && p.end && timeToMinutes(p.end) > timeToMinutes(p.start));
     await persist({
       ...data,
       settings: {
@@ -3633,7 +3812,8 @@ function AdminConfig({
           duration: parseInt(a.duration) || 30,
           name: a.name.trim() || "Complemento"
         })),
-        timeSlots: parsedSlots.length > 0 ? parsedSlots : DEFAULT_DATA.settings.timeSlots,
+        periods: cleanPeriods.length > 0 ? cleanPeriods : DEFAULT_DATA.settings.periods,
+        slotStep: parseInt(slotStep) || 30,
         closedDays: settings.closedDays || [],
         proLaborePct: parseFloat(settings.proLaborePct) || 0,
         reservaPct: parseFloat(settings.reservaPct) || 0,
@@ -3811,16 +3991,65 @@ function AdminConfig({
       color: COLORS.muted,
       marginBottom: 8
     }
-  }, "Lista de horários do dia, separados por vírgula (mesmos horários todos os dias)."), /*#__PURE__*/React.createElement("textarea", {
-    value: slotsText,
-    onChange: e => setSlotsText(e.target.value),
-    rows: 3,
+  }, "Defina os períodos de atendimento do dia (ex.: manhã e tarde). O sistema calcula sozinho se um serviço cabe até o horário de fechamento — você não precisa ficar ajustando horário por horário."), periods.map((p, idx) => /*#__PURE__*/React.createElement("div", {
+    key: idx,
     style: {
-      ...input,
-      resize: "vertical",
-      fontFamily: "'JetBrains Mono', monospace",
-      fontSize: 12.5
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      marginBottom: 8
     }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: p.start,
+    onChange: e => updatePeriod(idx, "start", e.target.value),
+    style: { ...input, flex: 1 }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: { color: COLORS.muted, fontSize: 12.5 }
+  }, "até"), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: p.end,
+    onChange: e => updatePeriod(idx, "end", e.target.value),
+    style: { ...input, flex: 1 }
+  }), periods.length > 1 && /*#__PURE__*/React.createElement("button", {
+    onClick: () => removePeriod(idx),
+    style: {
+      background: "none",
+      border: "none",
+      cursor: "pointer",
+      padding: 6
+    }
+  }, /*#__PURE__*/React.createElement(Trash2, {
+    size: 14,
+    color: COLORS.muted
+  })))), /*#__PURE__*/React.createElement("button", {
+    onClick: addPeriod,
+    style: {
+      background: "none",
+      border: `1px dashed ${COLORS.border}`,
+      borderRadius: 8,
+      padding: "7px 12px",
+      fontSize: 12.5,
+      color: COLORS.muted,
+      cursor: "pointer",
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement(Plus, {
+    size: 13,
+    style: { marginRight: 6, verticalAlign: -2 }
+  }), "Adicionar período (ex.: manhã, tarde, plantão)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: COLORS.muted,
+      margin: "14px 0 6px"
+    }
+  }, "Intervalo entre horários oferecidos (minutos)"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 5,
+    step: 5,
+    value: slotStep,
+    onChange: e => setSlotStep(e.target.value),
+    style: { ...input, width: 100 }
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
