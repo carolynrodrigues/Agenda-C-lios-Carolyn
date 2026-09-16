@@ -1875,6 +1875,7 @@ function AdminAgenda({
   const [mAddOns, setMAddOns] = useState([]);
   const [mNotes, setMNotes] = useState("");
   const [mEncaixe, setMEncaixe] = useState(false);
+  const [mAttemptedSubmit, setMAttemptedSubmit] = useState(false);
   const [customTime, setCustomTime] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [formError, setFormError] = useState("");
@@ -1919,6 +1920,7 @@ function AdminAgenda({
     setMAddOns((b.addOns || []).map(a => a.id));
     setMNotes(b.notes || "");
     setMEncaixe(!!b.encaixe);
+    setMAttemptedSubmit(false);
   }
   function closeForm() {
     setManualOpen(null);
@@ -1929,10 +1931,15 @@ function AdminAgenda({
     setMAddOns([]);
     setMNotes("");
     setMEncaixe(false);
+    setMAttemptedSubmit(false);
     setFormError("");
   }
   async function saveBooking() {
-    if (!mName.trim()) return;
+    setMAttemptedSubmit(true);
+    if (!mName.trim()) {
+      setFormError("Falta preencher o nome do cliente.");
+      return;
+    }
     const service = settings.services.find(s => s.id === mService) || settings.services[0];
     const addOnsChosen = (settings.addOns || []).filter(a => mAddOns.includes(a.id) && a.id !== mService);
     const price = (service?.price || 0) + addOnsChosen.reduce((s, a) => s + a.price, 0);
@@ -2128,6 +2135,7 @@ function AdminAgenda({
       setMNotes("");
       setFormError("");
       setMEncaixe(true);
+      setMAttemptedSubmit(false);
       setManualOpen(customTime);
     }
   }, /*#__PURE__*/React.createElement(Plus, {
@@ -2306,6 +2314,8 @@ function AdminAgenda({
         setMPayment(PAYMENTS[0]);
         setMAddOns([]);
         setFormError("");
+        setMEncaixe(false);
+        setMAttemptedSubmit(false);
         setManualOpen(h);
       }
     }, /*#__PURE__*/React.createElement(Plus, {
@@ -2425,7 +2435,10 @@ function AdminAgenda({
     placeholder: "Nome do cliente",
     value: mName,
     onChange: e => setMName(e.target.value),
-    style: input
+    style: {
+      ...input,
+      ...(mAttemptedSubmit && !mName.trim() ? errorInput : {})
+    }
   }), /*#__PURE__*/React.createElement("input", {
     placeholder: "Telefone (opcional)",
     value: mPhone,
